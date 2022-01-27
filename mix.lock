@@ -1,0 +1,3 @@
+%{
+  "erlbz2": {:git, "https://github.com/martti/erlbz2.git", "9ca3b03c63faff8893e7e30715da789c348a714d", []},
+}
