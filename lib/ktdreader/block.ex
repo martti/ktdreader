@@ -1,55 +1,50 @@
 defmodule Ktdreader.Block do
-  defstruct primary_key: "", block_start: 0, block_end: 0
+  def key_stream(reader, key_pos, key_length) do
+    Stream.resource(
+      fn ->
+        {:ok, file} = File.open(reader.filename, [:read, :binary, :raw, read_ahead: 1_000_000])
+        :file.position(file, key_pos)
+        {:ok, pos} = :file.read(file, 4)
+        <<items_count::size(32)-unsigned-integer-little>> = pos
+        key_block_size = key_length + 8
+        {file, items_count, key_block_size, 0}
+      end,
+      fn {file, items_count, key_block_size, count} ->
+        if count < items_count do
+          {:ok, key_block} = :file.read(file, key_block_size)
 
-    # search variable search_vin from primary keys
-    # return bzip2 blocks block_start block_end
-    def find(reader = %Ktdreader.Reader{}, keyword) do
-    :file.position(reader.data_file, reader.primary_key_position)
-    {:ok, primary_pos} = :file.read(reader.data_file, 4)
+          <<
+            key::size(key_length)-bytes,
+            block_start::size(32)-unsigned-integer-little,
+            block_end::size(32)-unsigned-integer-little
+          >> = key_block
 
-    <<
-      primary_items_count::size(32)-unsigned-integer-little
-    >> = primary_pos
-
-    primary_key_length = reader.primary_key_length
-    primary_key_pos_c = reader.primary_key_position + 4
-    :file.position(reader.data_file, primary_key_pos_c)
-
-    primary_key_block_size = primary_key_length + 8
-    primary_keys_block_size = primary_items_count * primary_key_block_size
-    {:ok, primary_keys_block} = :file.read(reader.data_file, primary_keys_block_size)
-
-    Enum.find_value(
-      for(<<chunk::size(primary_key_block_size)-bytes <- primary_keys_block>>, do: chunk),
-      fn x ->
-        <<
-          primary_key::size(primary_key_length)-bytes,
-          block_start::size(32)-unsigned-integer-little,
-          block_end::size(32)-unsigned-integer-little
-        >> = x
-
-        if check_primary_key(keyword, primary_key) == 1 do
-          %Ktdreader.Block{ primary_key: primary_key, block_start: block_start, block_end: block_end }
+          {[{key, block_start, block_end}], {file, items_count, key_block_size, count + 1}}
         else
-          false
+          {:halt, {file, items_count, key_block_size, 0}}
         end
-      end)
+      end,
+      fn {file, _, _, _} ->
+        File.close(file)
+      end
+    )
   end
 
-  defp check_primary_key(keyword, primary_key) do
-    Enum.reduce_while(
-      Enum.zip(String.to_charlist(keyword), String.to_charlist(primary_key)), 0,
-      fn {a, b}, acc ->
-        cond do
-          a > b ->
-            {:halt, -1}
+  def block_stream(reader, block_start, block_end, line_length, row_parser) do
+    Stream.resource(
+      fn ->
+        {:ok, file} = File.open(reader.filename, [:read, :binary, :raw, read_ahead: 1_000_000])
 
-          a < b ->
-            {:halt, 1}
+        block_size = block_end - block_start
+        :file.position(file, block_start)
+        {:ok, data_block} = :file.read(file, block_size)
+        data_block = :erlbz2.decompress(data_block)
 
-          a == b ->
-            {:cont, acc}
-        end
+        {reader, file, line_length, byte_size(data_block), data_block, 0}
+      end,
+      &row_parser.(&1),
+      fn {_, file, _, _, _, _} ->
+        File.close(file)
       end
     )
   end

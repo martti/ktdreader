@@ -1,5 +1,5 @@
 defmodule Ktdreader.Reader do
-  defstruct data_file: nil,
+  defstruct filename: "",
             version: "",
             records: 0,
             block_size: 0,
@@ -19,7 +19,7 @@ defmodule Ktdreader.Reader do
             reference_tables: []
 
   def from_file(filename) do
-    {:ok, data_file} = :file.open(filename, [:read, :binary])
+    {:ok, data_file} = :file.open(filename, [:read, :binary, :raw])
 
     {:ok, header} = :file.read(data_file, 768)
 
@@ -74,8 +74,8 @@ defmodule Ktdreader.Reader do
     # reference_table_count = Enum.reduce(reference_pos, 0, &if(&1 > 0, do: &2 + 1, else: &2))
     [column_reference_index, column_packed_positions] = column_indexes(column_items)
 
-    %Ktdreader.Reader{
-      data_file: data_file,
+    reader = %Ktdreader.Reader{
+      filename: filename,
       version: version,
       records: records,
       block_size: block_size,
@@ -97,13 +97,16 @@ defmodule Ktdreader.Reader do
       reference_padding: reference_padding(column_items),
       reference_tables: reference_tables(reference_pos, data_file)
     }
+
+    :file.close(data_file)
+    reader
   end
 
   defp reference_tables(reference_pos, data_file) do
     Enum.map(Enum.filter(reference_pos, &(&1 > 0)), fn pos ->
       :file.position(data_file, pos)
       {:ok, ref_tables} = :file.read(data_file, 256)
-      # IO.puts(Hexdump.to_string(ref_tables))
+
       <<
         ref_items::size(32)-unsigned-integer-little,
         item_width::size(32)-unsigned-integer-little,
@@ -112,10 +115,7 @@ defmodule Ktdreader.Reader do
 
       :file.position(data_file, pos + 2 * 4)
       {:ok, ref_tables} = :file.read(data_file, ref_items * item_width)
-      # IO.puts(Hexdump.to_string(ref_tables))
 
-      # IO.puts("ref_items: #{ref_items}")
-      # IO.puts("item_width: #{item_width}")
       parse_ref_tables(ref_items, item_width, ref_tables)
     end)
   end
@@ -131,8 +131,6 @@ defmodule Ktdreader.Reader do
     >> = rest
 
     items = for <<value::size(8)-integer <- items>>, do: value
-    # items = for value <- items, do: String.to_integer(value)
-    # items = ref_items(width, items)
 
     [items | parse_ref_tables(count - 1, width, rest)]
   end
@@ -154,9 +152,7 @@ defmodule Ktdreader.Reader do
   end
 
   defp reference_padding(column_items) do
-    Enum.reduce(column_items, 0, fn x, acc ->
-      type = Enum.at(x, 1)
-      length = Enum.at(x, 3)
+    Enum.reduce(column_items, 0, fn [_, type, _, length], acc ->
       padding = if type == 0, do: length - 2, else: 0
       acc + padding
     end)

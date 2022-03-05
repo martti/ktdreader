@@ -1,85 +1,90 @@
 defmodule Ktdreader.Rows do
-  # open block pointed by primary key index
-  def find(reader = %Ktdreader.Reader{}, block = %Ktdreader.Block{}, keyword) do
-    block_size = block.block_end - block.block_start
-    :file.position(reader.data_file, block.block_start)
-    {:ok, data_block} = :file.read(reader.data_file, block_size)
-    data_block = :erlbz2.decompress(data_block)
-    parse_rows(reader, keyword, data_block)
-  end
+  def parse_row({reader, file, line_length, block_size, data_block, count}) do
+    #  fn {file, block_size, data_block, count} ->
+    # IO.puts("ROW PARSER #{count} < #{block_size}")
 
-  defp parse_rows(_, _, <<>>) do
-    false
-  end
+    if count < block_size do
+      data_size = 8 * line_length
 
-  defp parse_rows(reader = %Ktdreader.Reader{}, keyword, data_block) do
-    <<
-      data_length::size(8)-unsigned-integer-little,
-      rest::binary
-    >> = data_block
+      <<
+        data_length::size(data_size)-unsigned-integer-little,
+        rest::binary
+      >> = data_block
 
-    # 1 is line length
-    read_length = data_length - 1
+      read_size = data_length - line_length
 
-    <<
-      column_data::size(read_length)-bytes,
-      rest::binary
-    >> = rest
+      <<
+        column_data::size(read_size)-bytes,
+        rest::binary
+      >> = rest
 
-    columns =
-      Enum.reduce(reader.column_items, [column_data, 0, []], fn x, acc ->
-        # name = Enum.at(x, 0)
-        type = Enum.at(x, 1)
-        start_pos = Enum.at(x, 2)
-        length = Enum.at(x, 3)
-        # column index
-        column_index = Enum.at(acc, 1)
+      # IO.puts(Hexdump.to_string(column_data))
 
-        [col_data, rest] =
-          if type == 0 do
-            <<
-              reference_index::size(16)-unsigned-integer-little,
-              rest::binary
-            >> = Enum.at(acc, 0)
+      {_, _, columns} =
+        Enum.reduce(reader.column_items, {column_data, 0, []}, fn [_name, type, start_pos, length],
+                                                                  {rest, column_index, columns} ->
+          # IO.puts("len: #{length}")
 
-            # fetch data from reference_tables
-            column_data =
-              Enum.at(
-                Enum.at(reader.reference_tables, Enum.at(reader.column_reference_index, column_index)),
-                reference_index
-              )
+          {cd, rest} =
+            case type do
+              0 ->
+                <<
+                  reference_index::size(16)-unsigned-integer-little,
+                  rest::binary
+                >> = rest
 
-            [List.to_string(column_data), rest]
-          else
-            length = if length == 0, do: read_length + reader.reference_padding - start_pos, else: length
+                # fetch data from reference_tables
+                reference_value =
+                  Enum.at(
+                    Enum.at(
+                      reader.reference_tables,
+                      Enum.at(reader.column_reference_index, column_index)
+                    ),
+                    reference_index
+                  )
 
-            <<
-              column_data::size(length)-bytes,
-              rest::binary
-            >> = Enum.at(acc, 0)
+                {List.to_string(reference_value), rest}
 
-            [column_data, rest]
-          end
+              1 ->
+                # last column length is 0, so read to end
+                length =
+                  if length == 0 do
+                    read_size + reader.reference_padding - start_pos
+                  else
+                    length
+                  end
 
-        [rest, column_index + 1, [col_data | Enum.at(acc, 2)]]
-      end)
-      |> Enum.at(2)
-      |> Enum.reverse()
+                <<
+                  column_data::size(length)-bytes,
+                  rest::binary
+                >> = rest
 
-    row_data = Enum.join(columns)
+                {column_data, rest}
+            end
 
-    # construct primary key field
-    primary_key =
-      Enum.reduce(reader.primary_key_items, "", fn x, acc ->
-        block_start = Enum.at(x, 2)
-        block_end = Enum.at(x, 3)
-        acc <> String.slice(row_data, block_start, block_end)
-      end)
+          {rest, column_index + 1, [cd | columns]}
+        end)
 
-    if primary_key == keyword do
-      columns
+      columns = Enum.reverse(columns)
+
+      # construct primary key
+      primary_key =
+        Enum.reduce(reader.primary_key_items, "", fn [_name, _, start, length], acc ->
+          acc <> String.slice(Enum.join(columns), start, length)
+        end)
+
+      # map columns
+      columns =
+        Enum.zip(reader.column_items, columns)
+        |> Enum.reduce(%{}, fn {[name, _, _, _], value}, acc ->
+          Map.put(acc, name, value)
+        end)
+
+      columns = Map.put(columns, "_PK", primary_key)
+
+      {[columns], {reader, file, line_length, block_size, rest, count + data_length}}
     else
-      parse_rows(reader, keyword, rest)
+      {:halt, {reader, file, line_length, block_size, data_block, 0}}
     end
   end
 end
